@@ -1,0 +1,154 @@
+<link rel="stylesheet" href="/stixmapper/css/stixmapper.css">
+<script src="/stixmapper/js/stixmapper.js"></script>
+
+<div x-data="alpineStixmapper()" x-init="initPage()">
+    <div>
+        <h2 x-text="name"></h2>
+        <p x-text="description"></p>
+    </div>
+    <hr>
+
+    <div class="box">
+        <h3>Upload STIX 2.x JSON</h3>
+        <div style="margin-bottom: 0.5rem;">
+            <input type="file" x-ref="stixFile" accept=".json,application/json">
+        </div>
+
+        <div style="margin-bottom: 0.5rem;">
+            <label><input type="checkbox" x-model="fallbackToParent"> Fallback to parent technique (T####) if sub-technique has no matches</label><br>
+            <label><input type="checkbox" x-model="filterByTactic"> Filter abilities by STIX kill-chain tactic</label>
+        </div>
+
+        <button class="button is-primary is-small" @click="runMatch()">Match</button>
+        <span x-show="loading" style="margin-left: 0.5rem;">Matching...</span>
+    </div>
+
+    <template x-if="error">
+        <article class="message is-danger">
+            <div class="message-body" x-text="error"></div>
+        </article>
+    </template>
+
+    <template x-if="results">
+        <div class="box">
+            <h3>Results</h3>
+            <p>
+                Techniques: <b x-text="results.techniques_total"></b> |
+                Matched: <b x-text="results.matches_total"></b> |
+                Unmatched: <b x-text="results.unmatched_total"></b>
+            </p>
+
+            <div style="margin-top: 1rem;">
+                <h4>Matches</h4>
+                <template x-if="results.matches && results.matches.length">
+                    <div>
+                        <template x-for="m in results.matches" :key="m.technique_id">
+                            <div style="margin-bottom: 1rem; padding: 0.5rem; border: 1px solid #ddd;">
+                                <div>
+                                    <b x-text="m.technique_id"></b>
+                                    <span x-show="m.tactics && m.tactics.length"> — Tactics: <span x-text="m.tactics.join(', ')"></span></span>
+                                </div>
+                                <ul style="margin-top: 0.5rem;">
+                                    <template x-for="ab in m.abilities" :key="ab.ability_id">
+                                        <li>
+                                            <b x-text="ab.name"></b>
+                                            <span> (</span><span x-text="ab.ability_id"></span><span>)</span>
+                                            <span x-show="ab.tactic"> — tactic: <span x-text="ab.tactic"></span></span>
+                                            <span x-show="ab.platforms && ab.platforms.length"> — platforms: <span x-text="ab.platforms.join(', ')"></span></span>
+                                            <div style="font-size: 0.9em; color: #555;" x-text="ab.description"></div>
+                                        </li>
+                                    </template>
+                                </ul>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+                <template x-if="!results.matches || !results.matches.length">
+                    <p>No matches found.</p>
+                </template>
+            </div>
+
+            <div style="margin-top: 1rem;">
+                <h4>Unmatched Techniques</h4>
+                <template x-if="results.unmatched && results.unmatched.length">
+                    <ul>
+                        <template x-for="tid in results.unmatched" :key="tid">
+                            <li x-text="tid"></li>
+                        </template>
+                    </ul>
+                </template>
+                <template x-if="!results.unmatched || !results.unmatched.length">
+                    <p>None</p>
+                </template>
+            </div>
+        </div>
+    </template>
+</div>
+
+<script>
+/*
+  Templates in CALDERA are enhanced with Alpine.js.
+  Read the docs: https://alpinejs.dev/
+*/
+
+function alpineStixmapper() {
+    return {
+        name: '{{ name }}',
+        description: '{{ description }}',
+        sampleVariable: '',
+        loading: false,
+        error: '',
+        results: null,
+        fallbackToParent: true,
+        filterByTactic: false,
+
+        initPage() {
+            // Optional health check
+            apiV2('GET', '/api/v2/health').then(() => {}).catch(() => {});
+        },
+
+        async runMatch() {
+            try {
+                this.error = '';
+                this.results = null;
+                const file = this.$refs.stixFile.files && this.$refs.stixFile.files[0];
+                if (!file) {
+                    this.error = 'Please choose a STIX JSON file.';
+                    return;
+                }
+                this.loading = true;
+
+                const text = await file.text();
+                const stix = JSON.parse(text);
+
+                const payload = {
+                    stix,
+                    options: {
+                        fallback_to_parent: this.fallbackToParent,
+                        filter_by_tactic: this.filterByTactic
+                    }
+                };
+
+                const resp = await apiV2('POST', '/plugin/stixmapper/stix/match', payload);
+                if (resp.status !== 'success') {
+                    throw new Error(resp.error || 'Unknown error');
+                }
+                this.results = resp;
+                toast('Matching complete', true);
+            } catch (e) {
+                console.error(e);
+                this.error = e.message || 'Error while matching STIX bundle.';
+                toast('Error while matching STIX bundle', false);
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        sampleFunction() {
+            this.sampleVariable = 'You clicked the button!';
+        }
+    };
+}
+
+// # sourceURL=stixmapper.js
+</script>
