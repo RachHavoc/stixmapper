@@ -1,136 +1,174 @@
-import logging
 import re
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Any
+
+MITRE_TECH_ID_RE = re.compile(r"^(?P<tech>T\d{4})(?:\.(?P<sub>\d{3}))?$", re.IGNORECASE)
+MITRE_URL_ID_RE = re.compile(r"/techniques/(?P<tech_id>T\d{4})(?:/(?P<sub>\d{3}))?", re.IGNORECASE)
 
 class StixmapperService:
     def __init__(self, services):
         self.services = services
-        self.file_svc = services.get('file_svc')
-        self.log = logging.getLogger('stixmapper_svc')
+        self.data_svc = services.get('data_svc')
+        self.log = services.get('app_svc').log if services.get('app_svc') else None
 
-    async def foo(self):
-        return 'bar'
-
-    # Add functions here that call core services
-    async def match_stix_to_abilities(self, stix_bundle: dict, fallback_to_parent: bool = True, filter_by_tactic: bool = False) -> dict:
+    async def match_stix_to_abilities(self, stix_bundle: Dict,
+                                      fallback_to_parent: bool = True,
+                                      filter_by_tactic: bool = False) -> Dict:
         """
-        Given a STIX bundle, extract ATT&CK technique IDs and match them to CALDERA abilities.
-        - fallback_to_parent: if True, when STIX has a sub-technique T####.### but no exact matches exist,
-            try matching parent T#### abilities.
-        - filter_by_tactic: if True, only include abilities whose tactic matches one of the
-            technique's kill_chain_phases.
+        Map STIX 2.x attack-patterns to CALDERA abilities.
+        Supports spec_version 2.0 and 2.1.
+        Extracts MITRE technique/sub-technique IDs (e.g., T1055.011) from external_references.
+        Matches abilities by technique.attack_id. Falls back to parent technique if requested.
+        Optionally filters by tactics present in kill_chain_phases (kill_chain_name == 'mitre-attack').
         """
-        technique_to_tactics, techniques_found = self._extract_techniques_from_stix(stix_bundle)
-        abilities = await self._get_all_abilities()
+        if not isinstance(stix_bundle, dict) or stix_bundle.get('type') != 'bundle':
+            raise ValueError("Expected a STIX bundle object with type='bundle'")
 
-        # Build indexes for fast lookups
-        abilities_by_technique = {}
-        for ab in abilities:
-            tid = (getattr(ab, 'technique_id', None) or '').upper()
-            if not tid:
-                continue
-            abilities_by_technique.setdefault(tid, []).append(ab)
+        objs = stix_bundle.get('objects') or []
+        attack_patterns = [o for o in objs if o.get('type') == 'attack-pattern']
 
-        matches = []
-        unmatched = []
+        mappings: List[Dict] = []
+        ap_with_tech = 0
+        total_abilities = 0
 
-        for technique_id in sorted(techniques_found):
-            wanted_tactics = technique_to_tactics.get(technique_id, set())
-            # Exact match first
-            matched_list = list(abilities_by_technique.get(technique_id, []))
+        for ap in attack_patterns:
+            ap_id = ap.get('id')
+            ap_name = ap.get('name')
+            tactics = self._extract_mitre_tactics(ap)
+            technique_id = self._extract_mitre_technique_id(ap)
 
-            # Optional: filter abilities by tactic to match STIX kill chain phases
-            if filter_by_tactic and matched_list and wanted_tactics:
-                matched_list = [ab for ab in matched_list if getattr(ab, 'tactic', None) in wanted_tactics]
+            if technique_id:
+                ap_with_tech += 1
+                abilities = await self._find_abilities_for_attack_id(technique_id)
 
-            # Fallback to parent if requested and no matches yet
-            if not matched_list and fallback_to_parent and '.' in technique_id:
-                parent_id = technique_id.split('.')[0]
-                parent_matches = list(abilities_by_technique.get(parent_id, []))
-                if filter_by_tactic and parent_matches and wanted_tactics:
-                    parent_matches = [ab for ab in parent_matches if getattr(ab, 'tactic', None) in wanted_tactics]
-                matched_list = parent_matches
+                parent_technique_id = None
+                if not abilities and fallback_to_parent and '.' in technique_id:
+                    parent_technique_id = technique_id.split('.', 1)[0].upper()
+                    abilities = await self._find_abilities_for_attack_id(parent_technique_id)
 
-            if matched_list:
-                matches.append({
-                    'technique_id': technique_id,
-                    'tactics': sorted(list(wanted_tactics)),
-                    'abilities': [self._ability_to_dict(ab) for ab in matched_list]
+                if filter_by_tactic and tactics and abilities:
+                    tactic_set = set(tactics)
+                    abilities = [a for a in abilities if (a.get('tactic') in tactic_set)]
+
+                total_abilities += len(abilities)
+
+                mappings.append({
+                    "attack_pattern_id": ap_id,
+                    "name": ap_name,
+                    "technique_id": technique_id,
+                    **({"parent_technique_id": parent_technique_id} if parent_technique_id else {}),
+                    "tactics": tactics,
+                    "abilities": abilities
                 })
             else:
-                unmatched.append(technique_id)
+                mappings.append({
+                    "attack_pattern_id": ap_id,
+                    "name": ap_name,
+                    "technique_id": None,
+                    "tactics": tactics,
+                    "abilities": []
+                })
 
         return {
-            'techniques_total': len(techniques_found),
-            'matches_total': len(matches),
-            'unmatched_total': len(unmatched),
-            'matches': matches,
-            'unmatched': unmatched
+            "mappings": mappings,
+            "stats": {
+                "attack_patterns": len(attack_patterns),
+                "with_technique": ap_with_tech,
+                "abilities_found": total_abilities
+            }
         }
 
-    def _extract_techniques_from_stix(self, stix_bundle: dict) -> Tuple[Dict[str, Set[str]], Set[str]]:
+    def _extract_mitre_technique_id(self, ap: Dict) -> Optional[str]:
         """
-        Returns:
-            - mapping technique_id -> set of tactics (kill chain phase names), lower-case
-            - set of technique_ids
-        We focus on 'attack-pattern' objects and pull technique IDs from external_references.external_id fields
-        that look like T#### or T####.###. We also capture kill_chain_phases.phase_name as tactics.
+        Extract Txxxx or Txxxx.xxx from external_references with source_name 'mitre-attack',
+        or parse it from ATT&CK URLs like https://attack.mitre.org/techniques/T1055/011.
+        Returns uppercase technique ID or None.
         """
-        technique_to_tactics: Dict[str, Set[str]] = {}
-        techniques_found: Set[str] = set()
+        refs = ap.get("external_references") or []
 
-        objects = stix_bundle.get('objects') or []
-        for obj in objects:
-            if not isinstance(obj, dict):
-                continue
-            if obj.get('type') != 'attack-pattern':
-                continue
+        # Prefer source_name == 'mitre-attack'
+        for ref in refs:
+            if (ref.get("source_name") or "").lower() == "mitre-attack":
+                ext_id = (ref.get("external_id") or "").strip()
+                if ext_id:
+                    m = MITRE_TECH_ID_RE.match(ext_id)
+                    if m:
+                        return m.group(0).upper()
+                url = ref.get("url") or ""
+                m = MITRE_URL_ID_RE.search(url)
+                if m:
+                    tech = m.group("tech_id").upper()
+                    sub = m.group("sub")
+                    return f"{tech}.{sub}" if sub else tech
 
-            tactic_names = set()
-            for kcp in obj.get('kill_chain_phases', []) or []:
-                # Commonly kill_chain_name: 'mitre-attack', phase_name: 'defense-evasion', etc.
-                phase = (kcp.get('phase_name') or '').strip().lower()
-                if phase:
-                    tactic_names.add(phase)
+        # Fallback: any URL that contains /techniques/Txxxx(/xxx)
+        for ref in refs:
+            url = ref.get("url") or ""
+            m = MITRE_URL_ID_RE.search(url)
+            if m:
+                tech = m.group("tech_id").upper()
+                sub = m.group("sub")
+                return f"{tech}.{sub}" if sub else tech
 
-            # Collect technique IDs from external_references
-            for ref in obj.get('external_references', []) or []:
-                ext_id = (ref.get('external_id') or '').strip()
-                # Accept T#### or T####.### case-insensitively
-                if ext_id and re.match(r'(?i)^T\d{4}(\.\d{3})?$', ext_id):
-                    tid = ext_id.upper()
-                    techniques_found.add(tid)
-                    if tactic_names:
-                        technique_to_tactics.setdefault(tid, set()).update(tactic_names)
+        return None
 
-        return technique_to_tactics, techniques_found
-
-    async def _get_all_abilities(self):
+    def _extract_mitre_tactics(self, ap: Dict) -> List[str]:
         """
-        Return all abilities from CALDERA's data service.
+        Return tactic phase_names for kill_chain_name == 'mitre-attack'.
+        Example: ['defense-evasion','privilege-escalation'].
         """
-        # In CALDERA, data_svc.locate('abilities', match_dict) returns a list of Ability objects
-        return await self.data_svc.locate('abilities', match=dict())
+        phases = ap.get("kill_chain_phases") or []
+        tactics: Set[str] = set()
+        for p in phases:
+            if (p.get("kill_chain_name") or "").lower() == "mitre-attack":
+                ph = (p.get("phase_name") or "").strip()
+                if ph:
+                    tactics.add(ph)
+        return sorted(tactics)
 
-    def _ability_to_dict(self, ab) -> dict:
+    async def _find_abilities_for_attack_id(self, attack_id: str) -> List[Dict]:
         """
-        Convert an Ability object to a minimal serializable dict for the UI.
+        Locate abilities whose technique.attack_id equals attack_id (e.g., 'T1055' or 'T1055.011').
+        Normalizes output fields: ability_id, name, tactic, technique.attack_id, technique.name.
         """
-        platforms = []
-        try:
-            # ability.platforms is typically a dict of platform->executors
-            if hasattr(ab, 'platforms') and isinstance(ab.platforms, dict):
-                platforms = list(ab.platforms.keys())
-        except Exception:
-            platforms = []
+        # Fetch all abilities and filter in Python to handle nested fields robustly
+        all_abilities = await self.data_svc.locate('abilities')
 
-        return {
-            'ability_id': getattr(ab, 'ability_id', None),
-            'name': getattr(ab, 'name', None),
-            'description': getattr(ab, 'description', None),
-            'tactic': getattr(ab, 'tactic', None),
-            'technique_id': getattr(ab, 'technique_id', None),
-            'technique_name': getattr(ab, 'technique_name', None),
-            'plugin': getattr(ab, 'plugin', None),
-            'platforms': platforms
-        }
+        matched: List[Dict] = []
+        for a in all_abilities or []:
+            # Handle both dict and object ability representations
+            tech = self._get(a, ["technique"]) or {}
+            ability_attack_id = None
+            if isinstance(tech, dict):
+                ability_attack_id = tech.get("attack_id")
+                tech_name = tech.get("name")
+            else:
+                ability_attack_id = getattr(tech, "attack_id", None)
+                tech_name = getattr(tech, "name", None)
+
+            if (ability_attack_id or "").upper() == attack_id.upper():
+                aid = self._get(a, ["ability_id"]) or self._get(a, ["id"]) or getattr(a, "ability_id", None) or getattr(a, "id", None)
+                matched.append({
+                    "ability_id": aid,
+                    "name": self._get(a, ["name"]) or getattr(a, "name", None),
+                    "tactic": self._get(a, ["tactic"]) or getattr(a, "tactic", None),
+                    "technique": {
+                        "attack_id": ability_attack_id,
+                        "name": tech_name
+                    }
+                })
+
+        return matched
+
+    def _get(self, obj: Any, path: List[str], default: Any = None) -> Any:
+        """
+        Safely get nested keys from dicts; falls back to attributes if dict access fails.
+        """
+        cur: Any = obj
+        for key in path:
+            if isinstance(cur, dict):
+                cur = cur.get(key)
+            else:
+                cur = getattr(cur, key, None)
+            if cur is None:
+                return default
+        return cur
